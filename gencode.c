@@ -56,6 +56,11 @@ static const char rcsid[] _U_ =
 #include <sys/param.h>
 #endif
 
+#ifdef __linux__
+#include <linux/filter.h>
+#undef BPF_MAJOR_VERSION
+#endif
+
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -135,9 +140,9 @@ static pcap_t *bpf_pcap;
 
 /* Hack for updating VLAN, MPLS, and PPPoE offsets. */
 #ifdef WIN32
-static u_int	orig_linktype = (u_int)-1, orig_nl = (u_int)-1, label_stack_depth = (u_int)-1;
+static u_int	orig_linktype = (u_int)-1, orig_nl = (u_int)-1, label_stack_depth = (u_int)-1, vlan_stack_depth = (u_int)-1;
 #else
-static u_int	orig_linktype = -1U, orig_nl = -1U, label_stack_depth = -1U;
+static u_int	orig_linktype = -1U, orig_nl = -1U, label_stack_depth = -1U, vlan_stack_depth = -1U;
 #endif
 
 /* XXX */
@@ -964,6 +969,7 @@ init_linktype(p)
 	orig_linktype = -1;
 	orig_nl = -1;
         label_stack_depth = 0;
+	vlan_stack_depth = 0;
 
 	reg_off_ll = -1;
 	reg_off_macpl = -1;
@@ -1897,8 +1903,35 @@ gen_ether_linktype(proto)
 			 * will fail and the frame won't match,
 			 * which is what we want).
 			 */
-			return gen_cmp(OR_LINK, off_linktype, BPF_H,
-			    (bpf_int32)proto);
+			b0 = gen_cmp(OR_LINK, off_linktype, BPF_H,
+				     (bpf_int32)proto);
+#if defined(SKF_AD_VLAN_TAG) && defined(SKF_AD_VLAN_TAG_PRESENT)
+			if (bpf_pcap->vlan_tag_in_pkt_meta_op &&
+			    bpf_pcap->vlan_tag_in_pkt_meta_op(bpf_pcap))
+			{
+				   struct slist *s;
+
+				   /* put a default "not vlan" for every default
+				      packet. For example, if you just say 'tcp port
+				      80', it should generate 'not vlan and tcp port
+				      80'. This is necessary because the vlan tags
+				      for these packets are not inline within the
+				      packet itself but in the metadata. So a simple
+				      comparison of the non-vlan ethertype in the
+				      specified offset won't do the job.
+				   */
+				   s = new_stmt(BPF_LD|BPF_B|BPF_ABS);
+				   s->s.k = SKF_AD_OFF + SKF_AD_VLAN_TAG_PRESENT;
+				   b1 = new_block(JMP(BPF_JEQ));
+				   b1->stmts = s;
+				   b1->s.k = 1; //true
+				   gen_not(b1);
+				   gen_and(b0,b1);
+				   b0 = b1;
+			}
+#endif
+			return b0;
+
 		}
 	}
 }
@@ -2082,8 +2115,35 @@ gen_linux_sll_linktype(proto)
 			 * will fail and the frame won't match,
 			 * which is what we want).
 			 */
-			return gen_cmp(OR_LINK, off_linktype, BPF_H,
+			b0 = gen_cmp(OR_LINK, off_linktype, BPF_H,
 			    (bpf_int32)proto);
+#if defined(SKF_AD_VLAN_TAG) && defined(SKF_AD_VLAN_TAG_PRESENT)
+			if (bpf_pcap->vlan_tag_in_pkt_meta_op &&
+			    bpf_pcap->vlan_tag_in_pkt_meta_op(bpf_pcap))
+			{
+				   struct slist *s;
+
+				   /* put a default "not vlan" for every default
+				      packet. For example, if you just say 'tcp port
+				      80', it should generate 'not vlan and tcp port
+				      80'. This is necessary because the vlan tags
+				      for these packets are not inline within the
+				      packet itself but in the metadata. So a simple
+				      comparison of the non-vlan ethertype in the
+				      specified offset won't do the job.
+				   */
+				   s = new_stmt(BPF_LD|BPF_B|BPF_ABS);
+				   s->s.k = SKF_AD_OFF + SKF_AD_VLAN_TAG_PRESENT;
+				   b1 = new_block(JMP(BPF_JEQ));
+				   b1->stmts = s;
+				   b1->s.k = 1; //true
+				   gen_not(b1);
+				   gen_and(b0,b1);
+				   b0 = b1;
+			}
+#endif
+			return b0;
+
 		}
 	}
 }
@@ -7904,28 +7964,59 @@ gen_vlan(vlan_num)
 	case DLT_EN10MB:
 	case DLT_NETANALYZER:
 	case DLT_NETANALYZER_TRANSPARENT:
-		/* check for VLAN, including QinQ */
-		b0 = gen_cmp(OR_LINK, off_linktype, BPF_H,
-		    (bpf_int32)ETHERTYPE_8021Q);
-		b1 = gen_cmp(OR_LINK, off_linktype, BPF_H,
-		    (bpf_int32)ETHERTYPE_8021QINQ);
-		gen_or(b0,b1);
-		b0 = b1;
+#if defined(SKF_AD_VLAN_TAG) && defined(SKF_AD_VLAN_TAG_PRESENT)
+		/* vlan_stack_depth keeps track of the first tag which is in the
+		 * packet metadata. The second tag onwards is within the packet data
+		 * itself and should work exactly like before
+		 */
+		if (bpf_pcap->vlan_tag_in_pkt_meta_op &&
+		    bpf_pcap->vlan_tag_in_pkt_meta_op(bpf_pcap) &&
+		    !vlan_stack_depth)
+		{
+			/* generate new filter code based on extracting packet
+			 * metadata */
+			struct slist *s;
+			s = new_stmt(BPF_LD|BPF_B|BPF_ABS);
+			s->s.k = SKF_AD_OFF + SKF_AD_VLAN_TAG_PRESENT;
+			b0 = new_block(JMP(BPF_JEQ));
+			b0->stmts = s;
+			b0->s.k = 1; //true
 
-		/* If a specific VLAN is requested, check VLAN id */
-		if (vlan_num >= 0) {
-			b1 = gen_mcmp(OR_MACPL, 0, BPF_H,
-			    (bpf_int32)vlan_num, 0x0fff);
-			gen_and(b0, b1);
+			if (vlan_num >= 0) {
+				s = new_stmt(BPF_LD|BPF_B|BPF_ABS);
+				s->s.k = SKF_AD_OFF + SKF_AD_VLAN_TAG;
+				b1 = new_block(JMP(BPF_JEQ));
+				b1->stmts = s;
+				b1->s.k = (bpf_int32)vlan_num;
+				gen_and(b0,b1);
+				b0 = b1;
+			}
+		} else
+#endif
+		{
+			/* check for VLAN, including QinQ */
+			b0 = gen_cmp(OR_LINK, off_linktype, BPF_H,
+				     (bpf_int32)ETHERTYPE_8021Q);
+			b1 = gen_cmp(OR_LINK, off_linktype, BPF_H,
+				     (bpf_int32)ETHERTYPE_8021QINQ);
+			gen_or(b0,b1);
 			b0 = b1;
-		}
 
-		off_macpl += 4;
-		off_linktype += 4;
+			/* If a specific VLAN is requested, check VLAN id */
+			if (vlan_num >= 0) {
+				b1 = gen_mcmp(OR_MACPL, 0, BPF_H,
+					      (bpf_int32)vlan_num, 0x0fff);
+				gen_and(b0, b1);
+				b0 = b1;
+			}
+
+			off_macpl += 4;
+			off_linktype += 4;
 #if 0
 		off_nl_nosnap += 4;
 		off_nl += 4;
 #endif
+		}
 		break;
 
 	default:
@@ -7933,6 +8024,8 @@ gen_vlan(vlan_num)
 		      linktype);
 		/*NOTREACHED*/
 	}
+
+	vlan_stack_depth++;
 
 	return (b0);
 }

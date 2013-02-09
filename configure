@@ -685,6 +685,7 @@ V_DEFS
 V_FINDALLDEVS
 V_INCLS
 V_PCAP
+BPF_FILTER_P
 V_SHLIB_CMD
 V_SHLIB_OPT
 V_SONAME_OPT
@@ -7267,6 +7268,20 @@ fi
 { echo "$as_me:$LINENO: result: $V_PCAP" >&5
 echo "${ECHO_T}$V_PCAP" >&6; }
 
+
+#
+# add custom filter execution modules
+#
+        { echo "$as_me:$LINENO: adding custom $V_PCAP filter execution module if it exists ..." >&5
+echo "$as_me: adding custom $V_PCAP filter execution module if it exists ..." >&6;}
+case "$V_PCAP" in
+linux)
+	BPF_FILTER_P=bpf_filter_linux.c
+{ echo "$as_me:$LINENO: result: yes" >&5
+echo "${ECHO_T}yes" >&6; }
+	;;
+esac
+
 #
 # Do capture-mechanism-dependent tests.
 #
@@ -7913,7 +7928,7 @@ cat >>conftest.$ac_ext <<_ACEOF
 int
 main ()
 {
-u_int i = sizeof(((struct tpacket_auxdata *)0)->tp_vlan_tci)
+__u16 i = sizeof(((struct tpacket_auxdata *)0)->tp_vlan_tci)
   ;
   return 0;
 }
@@ -12575,6 +12590,7 @@ V_DEFS!$V_DEFS$ac_delim
 V_FINDALLDEVS!$V_FINDALLDEVS$ac_delim
 V_INCLS!$V_INCLS$ac_delim
 V_PCAP!$V_PCAP$ac_delim
+BPF_FILTER_P!$BPF_FILTER_P$ac_delim
 V_SHLIB_CMD!$V_SHLIB_CMD$ac_delim
 V_SHLIB_OPT!$V_SHLIB_OPT$ac_delim
 V_SONAME_OPT!$V_SONAME_OPT$ac_delim
@@ -12601,7 +12617,7 @@ INSTALL_DATA!$INSTALL_DATA$ac_delim
 LTLIBOBJS!$LTLIBOBJS$ac_delim
 _ACEOF
 
-  if test `sed -n "s/.*$ac_delim\$/X/p" conf$$subs.sed | grep -c X` = 95; then
+  if test `sed -n "s/.*$ac_delim\$/X/p" conf$$subs.sed | grep -c X` = 96; then
     break
   elif $ac_last_try; then
     { { echo "$as_me:$LINENO: error: could not make $CONFIG_STATUS" >&5

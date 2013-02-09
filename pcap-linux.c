@@ -276,6 +276,16 @@ typedef int		socklen_t;
 
 #define MAX_LINKHEADER_SIZE	256
 
+/* these are the magic kernel versions that started
+ * supporting BPF packet filtering
+ * based on vlan tags that are present in the skb metadata
+ */
+#define BPF_VLAN_KVER 2
+#define BPF_VLAN_KPATCHLEVEL 6
+#define BPF_VLAN_KSUBLEVEL 38
+
+/* prototype for external function and methods */
+u_int	bpf_filter_linux(const struct bpf_insn *, const u_char *, u_int16_t, u_int, u_int);
 /*
  * When capturing on all interfaces we use this as the buffer size.
  * Should be bigger then all MTUs that occur in real life.
@@ -302,6 +312,7 @@ static int pcap_stats_linux(pcap_t *, struct pcap_stat *);
 static int pcap_setfilter_linux(pcap_t *, struct bpf_program *);
 static int pcap_setdirection_linux(pcap_t *, pcap_direction_t);
 static void pcap_cleanup_linux(pcap_t *);
+static int pcap_vlan_tag_in_pkt_linux(pcap_t *);
 
 union thdr {
 	struct tpacket_hdr	*h1;
@@ -355,6 +366,11 @@ static struct sock_filter	total_insn
 static struct sock_fprog	total_fcode
 	= { 1, &total_insn };
 #endif /* SO_ATTACH_FILTER */
+
+static int
+pcap_vlan_tag_in_pkt_linux(pcap_t *p) {
+   return vlan_tag_in_pkt_auxdata();
+}
 
 pcap_t *
 pcap_create_interface(const char *device, char *ebuf)
@@ -1179,6 +1195,7 @@ pcap_activate_linux(pcap_t *handle)
 	handle->cleanup_op = pcap_cleanup_linux;
 	handle->read_op = pcap_read_linux;
 	handle->stats_op = pcap_stats_linux;
+	handle->vlan_tag_in_pkt_meta_op = pcap_vlan_tag_in_pkt_linux;
 
 	/*
 	 * The "any" device is a special device which causes us not
@@ -1330,6 +1347,19 @@ pcap_read_linux(pcap_t *handle, int max_packets, pcap_handler callback, u_char *
 	return pcap_read_packet(handle, callback, user);
 }
 
+/* push a vlan tag extracted from the auxdata into the packet */
+static void
+insert_vlan_tag_into_packet(pcap_t *handle, u_char **bp, __u16 tp_vlan_tci)
+{
+	struct vlan_tag *tag;
+	*bp -= VLAN_TAG_LEN;
+	memmove(*bp, *bp + VLAN_TAG_LEN, handle->md.vlan_offset);
+
+	tag = (struct vlan_tag *)(*bp + handle->md.vlan_offset);
+	tag->vlan_tpid = htons(ETH_P_8021Q);
+	tag->vlan_tci = htons(tp_vlan_tci);
+	return;
+}
 /*
  *  Read a packet from the socket calling the handler provided by
  *  the user. Returns the number of packets received or -1 if an
@@ -1354,6 +1384,7 @@ pcap_read_packet(pcap_t *handle, pcap_handler callback, u_char *userdata)
 		struct cmsghdr	cmsg;
 		char		buf[CMSG_SPACE(sizeof(struct tpacket_auxdata))];
 	} cmsg_buf;
+	__u16 tp_vlan_tci = 0;
 #else /* defined(HAVE_PACKET_AUXDATA) && defined(HAVE_LINUX_TPACKET_AUXDATA_TP_VLAN_TCI) */
 	socklen_t		fromlen;
 #endif /* defined(HAVE_PACKET_AUXDATA) && defined(HAVE_LINUX_TPACKET_AUXDATA_TP_VLAN_TCI) */
@@ -1557,14 +1588,8 @@ pcap_read_packet(pcap_t *handle, pcap_handler callback, u_char *userdata)
 			if (len < (unsigned int) handle->md.vlan_offset)
 				break;
 
-			bp -= VLAN_TAG_LEN;
-			memmove(bp, bp + VLAN_TAG_LEN, handle->md.vlan_offset);
+			tp_vlan_tci = aux->tp_vlan_tci;
 
-			tag = (struct vlan_tag *)(bp + handle->md.vlan_offset);
-			tag->vlan_tpid = htons(ETH_P_8021Q);
-			tag->vlan_tci = htons(aux->tp_vlan_tci);
-
-			packet_len += VLAN_TAG_LEN;
 		}
 	}
 #endif /* defined(HAVE_PACKET_AUXDATA) && defined(HAVE_LINUX_TPACKET_AUXDATA_TP_VLAN_TCI) */
@@ -1608,14 +1633,19 @@ pcap_read_packet(pcap_t *handle, pcap_handler callback, u_char *userdata)
 
 	/* Run the packet filter if not using kernel filter */
 	if (!handle->md.use_bpf && handle->fcode.bf_insns) {
-		if (bpf_filter(handle->fcode.bf_insns, bp,
-		                packet_len, caplen) == 0)
+		if (bpf_filter_linux(handle->fcode.bf_insns, bp, tp_vlan_tci,
+				packet_len, caplen) == 0)
 		{
 			/* rejected by filter */
 			return 0;
 		}
 	}
-
+	/* insert the vlan tag information back into the packet after we have run our
+	 * filter */
+	if (tp_vlan_tci) {
+		insert_vlan_tag_into_packet(handle, &bp, tp_vlan_tci);
+		packet_len += VLAN_TAG_LEN;
+	}
 	/* Fill in our own header data */
 
 	if (ioctl(handle->fd, SIOCGSTAMP, &pcap_header.ts) == -1) {
@@ -3804,6 +3834,7 @@ pcap_read_linux_mmap(pcap_t *handle, int max_packets, pcap_handler callback,
 		unsigned int tp_snaplen;
 		unsigned int tp_sec;
 		unsigned int tp_usec;
+                __u16 tp_vlan_tci = 0;
 
 		h.raw = pcap_get_ring_frame(handle, TP_STATUS_USER);
 		if (!h.raw)
@@ -3840,23 +3871,6 @@ pcap_read_linux_mmap(pcap_t *handle, int max_packets, pcap_handler callback,
 				tp_mac, tp_snaplen, handle->bufsize);
 			return -1;
 		}
-
-		/* run filter on received packet
-		 * If the kernel filtering is enabled we need to run the
-		 * filter until all the frames present into the ring 
-		 * at filter creation time are processed. 
-		 * In such case md.use_bpf is used as a counter for the 
-		 * packet we need to filter.
-		 * Note: alternatively it could be possible to stop applying 
-		 * the filter when the ring became empty, but it can possibly
-		 * happen a lot later... */
-		bp = (unsigned char*)h.raw + tp_mac;
-		run_bpf = (!handle->md.use_bpf) || 
-			((handle->md.use_bpf>1) && handle->md.use_bpf--);
-		if (run_bpf && handle->fcode.bf_insns && 
-				(bpf_filter(handle->fcode.bf_insns, bp,
-					tp_len, tp_snaplen) == 0))
-			goto skip;
 
 		/*
 		 * Do checks based on packet direction.
@@ -3945,15 +3959,30 @@ pcap_read_linux_mmap(pcap_t *handle, int max_packets, pcap_handler callback,
 #endif
 		    handle->md.vlan_offset != -1 &&
 		    tp_snaplen >= (unsigned int) handle->md.vlan_offset) {
-			struct vlan_tag *tag;
-
-			bp -= VLAN_TAG_LEN;
-			memmove(bp, bp + VLAN_TAG_LEN, handle->md.vlan_offset);
-
-			tag = (struct vlan_tag *)(bp + handle->md.vlan_offset);
-			tag->vlan_tpid = htons(ETH_P_8021Q);
-			tag->vlan_tci = htons(h.h2->tp_vlan_tci);
-
+                        tp_vlan_tci = h.h2->tp_vlan_tci;
+                }
+#endif
+		/* run filter on received packet
+		 * If the kernel filtering is enabled we need to run the
+		 * filter until all the frames present into the ring
+		 * at filter creation time are processed.
+		 * In such case md.use_bpf is used as a counter for the
+		 * packet we need to filter.
+		 * Note: alternatively it could be possible to stop applying
+		 * the filter when the ring became empty, but it can possibly
+		 * happen a lot later... */
+		bp = (unsigned char*)h.raw + tp_mac;
+		run_bpf = (!handle->md.use_bpf) ||
+			((handle->md.use_bpf>1) && handle->md.use_bpf--);
+		if (run_bpf && handle->fcode.bf_insns) {
+			if(bpf_filter_linux(handle->fcode.bf_insns, bp, tp_vlan_tci,
+					    tp_len, tp_snaplen) == 0)
+				goto skip;
+		}
+#ifdef HAVE_TPACKET2
+		/* insert the vlan tag into the packet now */
+		if (tp_vlan_tci) {
+			insert_vlan_tag_into_packet(handle, &bp, tp_vlan_tci);
 			pcaphdr.caplen += VLAN_TAG_LEN;
 			pcaphdr.len += VLAN_TAG_LEN;
 		}
